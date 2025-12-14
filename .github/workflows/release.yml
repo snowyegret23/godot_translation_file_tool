@@ -34,7 +34,7 @@ jobs:
       if: startsWith(github.ref, 'refs/tags/')
       with:
         files: dist/godot_translation_file_tool.exe
-        draft: true
+        draft: false
         generate_release_notes: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
