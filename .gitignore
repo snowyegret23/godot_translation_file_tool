@@ -1,5 +1,12 @@
 .env
 
+# Godotpcktool
+godotpcktool.exe
+assets/
+*.csv
+*.pck
+*.translation
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

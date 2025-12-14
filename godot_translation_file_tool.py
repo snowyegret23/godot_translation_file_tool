@@ -8,12 +8,13 @@ from io import BufferedReader, BufferedWriter
 import csv
 from dotenv import load_dotenv
 import smaz
+import argparse
+import subprocess
+import shutil
 
-
-def chunks(lst: list, n: int) -> list[list]:  # type: ignore
+def chunks(lst: list, n: int) -> list[list]:
     for i in range(0, len(lst), n):
         yield lst[i : i + n]
-
 
 @dataclass
 class Writer:
@@ -56,7 +57,6 @@ class Writer:
         encoded = x.encode() + b"\0"
         self.store_u32(len(encoded))
         self.file.write(encoded)
-
 
 @dataclass
 class Reader:
@@ -105,14 +105,12 @@ class Reader:
         length = self.get_u32()
         return self.file.read(length)[:-1].decode()
 
-
 class Flag(IntEnum):
     FORMAT_FLAG_NAMED_SCENE_IDS = 1
     FORMAT_FLAG_UIDS = 2
     FORMAT_FLAG_REAL_T_IS_DOUBLE = 4
     FORMAT_FLAG_HAS_SCRIPT_CLASS = 8
     RESERVED_FIELDS = 11
-
 
 class PropType(IntEnum):
     VARIANT_NIL = 1
@@ -164,7 +162,6 @@ class PropType(IntEnum):
     FORMAT_VERSION_CAN_RENAME_DEPS = 1
     FORMAT_VERSION_NO_NODEPATH_PROPERTY = 3
 
-
 @dataclass
 class Resource:
     version_major: int
@@ -176,14 +173,13 @@ class Resource:
     string_map: list[str]
     properties: dict[str, any]
 
-
 def parse_resource(path: str) -> Resource:
     with open(path, "rb") as f:
         r = Reader(f)
         assert b"RSRC" == r.read(4)
         big_endian = r.get_i32() == 1
         use_real64 = r.get_i32() == 1
-        r.big_endian = big_endian  # 수정: set_big_endian -> big_endian 직접 할당
+        r.big_endian = big_endian
         version_major = r.get_i32()
         version_minor = r.get_i32()
         format_version = r.get_i32()
@@ -248,7 +244,6 @@ def parse_resource(path: str) -> Resource:
                 length = r.get_u32()
                 return [r.get_i32() for _ in range(length)]
             else:
-                print("unknown prop type", prop_type)
                 return None
 
         external_resources = []
@@ -277,7 +272,6 @@ def parse_resource(path: str) -> Resource:
                 value = _parse_value()
                 properties[name] = value
 
-            # 새로 추가된 _skip_save_ 메타데이터 처리
             if "_skip_save_" in properties.get("__meta__", {}):
                 continue
 
@@ -286,14 +280,12 @@ def parse_resource(path: str) -> Resource:
 
         return main_resource
 
-
 def hash(d: int, b: bytes) -> int:
     if d == 0:
         d = 0x1000193
     for c in b:
         d = (d * 0x1000193) ^ c
     return d
-
 
 @dataclass
 class Elem:
@@ -302,13 +294,11 @@ class Elem:
     comp_size: int
     uncomp_size: int
 
-
 @dataclass
 class Bucket:
     size: int
     func: int
     elem: list[Elem]
-
 
 class BinaryTranslate:
     def __init__(self, path: str):
@@ -330,7 +320,7 @@ class BinaryTranslate:
             use_real64 = False
             w.store_i32(1 if big_endian else 0)
             w.store_i32(1 if use_real64 else 0)
-            w.big_endian = big_endian  # 수정: set_big_endian 제거
+            w.big_endian = big_endian
 
             w.store_i32(r.version_major)
             w.store_i32(r.version_minor)
@@ -350,8 +340,8 @@ class BinaryTranslate:
             for s in r.string_map:
                 w.store_unicode(s)
 
-            w.store_u32(0)  # external resources size
-            w.store_u32(1)  # internal resources size
+            w.store_u32(0)
+            w.store_u32(1)
             w.store_unicode("local://0")
             offset = f.tell() + 8
             w.store_u64(offset)
@@ -359,26 +349,22 @@ class BinaryTranslate:
             w.store_unicode(r.class_name)
             w.store_i32(4)
 
-            # locale
             w.store_u32(r.string_map.index("locale"))
             w.store_u32(PropType.VARIANT_STRING)
             w.store_unicode(self.locale)
 
-            # hash table
             w.store_u32(r.string_map.index("hash_table"))
             w.store_u32(PropType.VARIANT_PACKED_INT32_ARRAY)
             w.store_u32(len(self.hash_table))
             for v in self.hash_table:
                 w.store_i32(v)
 
-            # bucket_table
             w.store_u32(r.string_map.index("bucket_table"))
             w.store_u32(PropType.VARIANT_PACKED_INT32_ARRAY)
             w.store_u32(len(self.bucket_table))
             for v in self.bucket_table:
                 w.store_i32(v)
 
-            # strings
             w.store_u32(r.string_map.index("strings"))
             w.store_u32(PropType.VARIANT_PACKED_BYTE_ARRAY)
             w.store_u32(len(self.strings))
@@ -466,56 +452,151 @@ class BinaryTranslate:
         self.bucket_table = new_bucket_table
         self.strings = new_strings
 
-
 load_dotenv()
 
+def get_godotpcktool_path():
+    current_dir_tool = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "godotpcktool.exe")
+    if os.path.exists(current_dir_tool):
+        return current_dir_tool
+    
+    path_tool = shutil.which("godotpcktool")
+    if path_tool:
+        return path_tool
+        
+    return None
+
+def run_godotpcktool(pck_path: str, action: str, file_filter: str = None, output_path: str = None, extra_args: list = None):
+    tool_path = get_godotpcktool_path()
+    if tool_path is None:
+        print("Error: 'godotpcktool.exe' not found.")
+        print("Please download the latest version from https://github.com/hhyyrylainen/GodotPckTool/releases and place it in the same folder as this script.")
+        sys.exit(1)
+
+    cmd = [tool_path, pck_path, "--action", action]
+    if file_filter:
+        cmd.extend(["--include-regex-filter", file_filter])
+    if output_path:
+        cmd.extend(["--output", output_path])
+    if extra_args:
+        cmd.extend(extra_args)
+        
+    print(f"Executing: {' '.join(cmd)}")
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Error occurred: {e}")
+        sys.exit(1)
+
+def main():
+    parser = argparse.ArgumentParser(description="Godot Translation file Tool")
+    parser.add_argument("--pck", help="Path to the .pck file (Optional)")
+    parser.add_argument("--export", dest="export_file", help="Name of the .translation file to extract/convert (e.g., text.en.translation)")
+    parser.add_argument("--import", dest="import_file", help="Path to the .csv file to import/apply")
+    parser.add_argument("--locale", default="en", help="Locale code (default: en)")
+
+    args = parser.parse_args()
+    
+    print("Godot Translation file Tool v1.1 by Snowyegret, Original by eunchuldev")
+    current_directory = os.path.dirname(os.path.abspath(sys.argv[0])) 
+    
+    if args.export_file:
+        target_file = args.export_file
+        if args.pck:
+            print(f"Extracting {args.export_file} from {args.pck}...")
+            run_godotpcktool(args.pck, "extract", args.export_file, current_directory)
+            
+            found = False
+            for root, dirs, files in os.walk(current_directory):
+                if args.export_file in files:
+                    target_file = os.path.join(root, args.export_file)
+                    found = True
+                    break
+            if not found:
+                 print(f"Error: Extracted {args.export_file} but could not find it.")
+                 sys.exit(1)
+        else:
+             print(f"Single File Mode: Processing local file {target_file}...")
+             if not os.path.exists(target_file):
+                 print(f"Error: File '{target_file}' not found. Use --pck option or check the file path.")
+                 sys.exit(1)
+
+        print(f"Converting {target_file} to CSV...")
+        try:
+            messages = BinaryTranslate(target_file).get_messages()
+            csv_filename = f"{args.export_file}.csv"
+            with open(csv_filename, "w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f, quoting=csv.QUOTE_ALL)
+                writer.writerow(["index", "original", "translated"])
+                for i, m in enumerate(messages):
+                    writer.writerow([str(i), m, ""])
+            print(f"Successfully exported to {csv_filename}")
+        except Exception as e:
+            print(f"Error processing file: {e}")
+
+    elif args.import_file:
+        print(f"Importing {args.import_file}...")
+        
+        base_name = os.path.basename(args.import_file)
+        if base_name.lower().endswith(".csv"):
+            target_translation_name = base_name[:-4] 
+        else:
+            target_translation_name = base_name
+        
+        print(f"Target resource: {target_translation_name}")
+        
+        target_file = target_translation_name
+        
+        if args.pck:
+            print(f"Extracting base file {target_translation_name} from {args.pck}...")
+            run_godotpcktool(args.pck, "extract", target_translation_name, current_directory)
+            found = False
+            for root, dirs, files in os.walk(current_directory):
+                if target_translation_name in files:
+                    target_file = os.path.join(root, target_translation_name)
+                    found = True
+                    break
+            if not found:
+                print(f"Error: Could not find {target_translation_name} in PCK.")
+                sys.exit(1)
+        else:
+             print(f"Single File Mode: Patching local file {target_file}...")
+             if not os.path.exists(target_file):
+                 print(f"Error: Target file '{target_file}' not found. Use --pck option to extract original or check file path.")
+                 sys.exit(1)
+
+        print(f"Patching {target_file} with {args.import_file}...")
+        try:
+            resource = BinaryTranslate(target_file)
+            messages = []
+            with open(args.import_file, "r", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                for i, row in enumerate(reader):
+                    if i == 0: continue
+                    messages.append(row[1] if row[2] == "" else row[2])
+            
+            resource.replace(messages)
+            resource.locale = args.locale
+            resource.save(target_file)
+            print(f"Applied translation to {target_file}")
+
+            if args.pck:
+                print(f"Repacking {target_file} into {args.pck}...")
+                
+                rel_path = os.path.relpath(target_file, current_directory)
+                
+                run_godotpcktool(args.pck, "add", file_filter=None, output_path=None, extra_args=[rel_path])
+                print("Repack complete.")
+
+        except Exception as e:
+            print(f"Error applying translation: {e}")
+            sys.exit(1)
+    else:
+        parser.print_help()
+
+    print("Done!")
 
 if __name__ == "__main__":
     try:
-        print("Godot 4.1.4 Translation Tool v1.0 by Snowyegret, Original by eunchuldev")
-        current_directory = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(__file__)
-        command = sys.argv[1]
-        print(f"current directory: {current_directory}, command: {command}")
-        if command == "extract":
-            for root, dirs, files in os.walk(os.path.join(current_directory, "Patchdata")):
-                for name in files:
-                    path = os.path.join(root, name)
-                    _, ext = os.path.splitext(name)
-                    if ext.lower() != ".translation":
-                        continue
-                    print(f"extracting {path}")
-                    messages = BinaryTranslate(path).get_messages()
-                    with open(f"{os.path.join(current_directory, name)}.csv", "w", encoding="utf-8", newline="") as f:
-                        writer = csv.writer(f, quoting=csv.QUOTE_ALL)
-                        writer.writerow(["index", "original", "translated"])
-                        for i, m in enumerate(messages):
-                            writer.writerow([str(i), m, ""])
-                            print(f"{str(i)}: {m}")
-
-        elif command == "apply":
-            locale = "en"
-            for root, dirs, files in os.walk(os.path.join(current_directory, "Patchdata")):
-                for name in files:
-                    path = os.path.join(root, name)
-                    _, ext = os.path.splitext(name)
-                    if ext.lower() != ".translation":
-                        continue
-                    print(f"applying {path}")
-                    resource = BinaryTranslate(path)
-                    translation_path = os.path.join(current_directory, f"{name}.csv")
-                    with open(translation_path, "r", encoding="utf-8") as f:
-                        reader = csv.reader(f)
-                        messages = []
-                        for i, row in enumerate(reader):
-                            if i == 0:
-                                continue
-                            messages.append(row[1] if row[2] == "" else row[2])
-                        resource.replace(messages)
-                        resource.locale = locale
-                        os.makedirs("applied", exist_ok=True)
-                        new_path = os.path.join(current_directory, "applied", name)
-                        print("apply to", new_path)
-                        resource.save(new_path)
-        print("Done!")
+        main()
     except Exception as e:
         print(f"Error: {e}")
