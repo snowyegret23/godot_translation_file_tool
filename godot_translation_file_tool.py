@@ -779,7 +779,7 @@ def main():
 
     args = parser.parse_args()
     
-    print("Godot Translation file Tool v1.5")
+    print("Godot Translation file Tool v1.6")
     current_directory = os.path.dirname(os.path.abspath(sys.argv[0])) 
     
     if args.export_file:
