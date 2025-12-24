@@ -37,7 +37,7 @@ def _smaz_decompress(buf: bytes) -> str:
         raise RuntimeError("No smaz implementation available. Install 'smaz-py3' (pip install smaz-py3) or enable network access to use bundled fallback.")
     return smaz.decompress(buf)
 
-def chunks(lst: list, n: int) -> list[list]:
+def chunks(lst: list, n: int) -> list[list]: # type: ignore
     for i in range(0, len(lst), n):
         yield lst[i : i + n]
 
@@ -212,11 +212,15 @@ class Resource:
     flags: int
     string_map: list[str]
     properties: dict[str, any]
-    was_compressed: bool = False 
+    was_compressed: bool = False
+    is_compact_header: bool = False
+    is_headless: bool = False # Added for resources missing RSRC header
 
 def parse_resource(path: str) -> Resource:
     file_obj = open(path, "rb")
     was_compressed = False
+    is_compact = False
+    is_headless = False
 
     try:
         # Check for RSCC compression header
@@ -224,11 +228,27 @@ def parse_resource(path: str) -> Resource:
         if magic == b"RSCC":
             was_compressed = True
             
-            # Read RSCC header
-            version = struct.unpack("<I", file_obj.read(4))[0]
-            mode = struct.unpack("<I", file_obj.read(4))[0] # 0=FastLZ, 1=Deflate, 2=Zstd, 3=Gzip
-            block_size = struct.unpack("<I", file_obj.read(4))[0]
-            total_size = struct.unpack("<Q", file_obj.read(8))[0]
+            # Check for Compact Header (Godot 4 variant)
+            # Peek first 8 bytes to identify format
+            pos_backup = file_obj.tell()
+            val1 = struct.unpack("<I", file_obj.read(4))[0]
+            val2 = struct.unpack("<I", file_obj.read(4))[0]
+            file_obj.seek(pos_backup)
+
+            if val1 == 2 and val2 == 4096:
+                # Compact Format Detected (Mode=2, BlockSize=4096)
+                print("Notice: Compact RSCC header detected.")
+                is_compact = True
+                version = 1 # Dummy
+                mode = struct.unpack("<I", file_obj.read(4))[0] # Reads 2 (Zstd)
+                block_size = struct.unpack("<I", file_obj.read(4))[0] # Reads 4096
+                total_size = struct.unpack("<I", file_obj.read(4))[0] # Reads 4 bytes Total Size
+            else:
+                # Standard Format
+                version = struct.unpack("<I", file_obj.read(4))[0]
+                mode = struct.unpack("<I", file_obj.read(4))[0] 
+                block_size = struct.unpack("<I", file_obj.read(4))[0]
+                total_size = struct.unpack("<Q", file_obj.read(8))[0]
             
             block_count = (total_size + block_size - 1) // block_size
             block_sizes = []
@@ -238,7 +258,7 @@ def parse_resource(path: str) -> Resource:
             decompressed_buffer = BytesIO()
             
             if mode == 0:
-                raise ValueError("RSCC compression mode 0 (FastLZ) is not supported by this tool (common in Godot 2.x).")
+                raise ValueError("RSCC compression mode 0 (FastLZ) is not supported.")
             elif mode == 1:
                 # Deflate
                 for size in block_sizes:
@@ -247,7 +267,7 @@ def parse_resource(path: str) -> Resource:
             elif mode == 2:
                 # Zstd
                 if zstd is None:
-                    raise ImportError("RSCC Zstd compressed file detected. Please install 'zstandard' (pip install zstandard) to parse this file.")
+                    raise ImportError("RSCC Zstd compressed file detected. Please install 'zstandard'.")
                 dctx = zstd.ZstdDecompressor()
                 for size in block_sizes:
                     chunk = file_obj.read(size)
@@ -267,10 +287,28 @@ def parse_resource(path: str) -> Resource:
             file_obj = decompressed_buffer
             magic = file_obj.read(4)
 
+        # Check for RSRC magic or Headless fallback
         r = Reader(file_obj)
-        if magic != b"RSRC":
-             raise ValueError("Invalid magic header. Expected 'RSRC' or 'RSCC'.")
         
+        if magic == b"RSRC":
+            is_headless = False
+        else:
+            file_obj.seek(0)
+            peek_be = struct.unpack("<I", file_obj.read(4))[0]
+            peek_r64 = struct.unpack("<I", file_obj.read(4))[0]
+            peek_ver = struct.unpack("<I", file_obj.read(4))[0]
+            
+            if peek_be <= 1 and peek_r64 <= 1 and peek_ver >= 3 and peek_ver <= 5:
+                print(f"Notice: Missing 'RSRC' header. Detected headless resource (Ver {peek_ver}). Proceeding...")
+                is_headless = True
+                file_obj.seek(0) # Rewind to start reading from BigEndian flag
+            else:
+                 print(f"Debug: Decompressed start hex: {magic.hex()} {struct.pack('<I', peek_be).hex()} {struct.pack('<I', peek_r64).hex()}")
+                 raise ValueError("Invalid magic header. Expected 'RSRC' or 'RSCC', and failed to detect headless resource.")
+        
+        if not is_headless:
+            pass
+
         big_endian = r.get_i32() == 1
         use_real64 = r.get_i32() == 1
         r.big_endian = big_endian
@@ -386,18 +424,11 @@ def parse_resource(path: str) -> Resource:
             elif prop_type == PropType.VARIANT_STRING_NAME:
                 return r.get_unicode()
             elif prop_type == PropType.VARIANT_NODE_PATH:
-                # Godot 1.x/2.x/3.x use 16-bit integers for name_count and subname_count
                 name_count = r.get_u16()
                 subname_count = r.get_u16()
-                # absolute = subname_count & 0x8000
                 subname_count &= 0x7FFF
-                
-                # In Godot 1.x/2.x and early 3.x, the 'property' field was sometimes stored 
-                # effectively as an extra subname or handled distinctively.
-                # Incrementing subname_count captures the property string if it exists in that sequence.
                 if format_version < 3: 
                     subname_count += 1
-                
                 for _ in range(name_count): _parse_name() 
                 for _ in range(subname_count): _parse_name()
                 return None
@@ -405,7 +436,6 @@ def parse_resource(path: str) -> Resource:
                 r.get_u32()
                 return None
             elif prop_type == PropType.VARIANT_OBJECT:
-                # Updated to handle Godot 1.x/2.x Object variants safely
                 obj_type = r.get_u32() 
                 if obj_type == PropType.OBJECT_EMPTY:
                     pass
@@ -431,7 +461,7 @@ def parse_resource(path: str) -> Resource:
                 for _ in range(length):
                     arr.append(_parse_value())
                 return arr
-            elif prop_type == PropType.VARIANT_PACKED_BYTE_ARRAY: # RAW_ARRAY in 1.x/2.x
+            elif prop_type == PropType.VARIANT_PACKED_BYTE_ARRAY:
                 length = r.get_u32()
                 res = b"".join(r.get_u8() for _ in range(length))
                 extra = 4 - (length % 4)
@@ -439,13 +469,13 @@ def parse_resource(path: str) -> Resource:
                     for _ in range(extra):
                         r.get_u8()
                 return res
-            elif prop_type == PropType.VARIANT_PACKED_INT32_ARRAY: # INT_ARRAY in 1.x/2.x
+            elif prop_type == PropType.VARIANT_PACKED_INT32_ARRAY:
                 length = r.get_u32()
                 return [r.get_i32() for _ in range(length)]
             elif prop_type == PropType.VARIANT_PACKED_INT64_ARRAY:
                 length = r.get_u32()
                 return [r.get_i64() for _ in range(length)]
-            elif prop_type == PropType.VARIANT_PACKED_FLOAT32_ARRAY: # REAL_ARRAY in 1.x/2.x
+            elif prop_type == PropType.VARIANT_PACKED_FLOAT32_ARRAY:
                 length = r.get_u32()
                 return [r.get_f32() for _ in range(length)]
             elif prop_type == PropType.VARIANT_PACKED_FLOAT64_ARRAY:
@@ -503,7 +533,7 @@ def parse_resource(path: str) -> Resource:
                 continue
 
             if i == len(internal_resources) - 1:
-                main_resource = Resource(version_major, version_minor, format_version, importmd_ofs, class_name, flags, string_map, properties, was_compressed)
+                main_resource = Resource(version_major, version_minor, format_version, importmd_ofs, class_name, flags, string_map, properties, was_compressed, is_compact, is_headless)
         
         file_obj.close()
         return main_resource
@@ -545,7 +575,10 @@ class BinaryTranslate:
     def _write_resource_data(self, f: BufferedWriter):
         r = self.resource
         w = Writer(f)
-        w.write(b"RSRC")
+        
+        if not r.is_headless:
+            w.write(b"RSRC")
+
         big_endian = False
         use_real64 = False # Preserving original flag in header
         w.store_i32(1 if big_endian else 0)
@@ -613,26 +646,33 @@ class BinaryTranslate:
         if extra < 4:
             w.write(b"\0" * extra)
 
-        w.write(b"RSRC")
+        if not r.is_headless:
+            w.write(b"RSRC")
 
     def save(self, path: str):
-        # 1. Generate Uncompressed Data
         uncompressed_buffer = BytesIO()
         self._write_resource_data(uncompressed_buffer)
         uncompressed_data = uncompressed_buffer.getvalue()
         uncompressed_buffer.close()
 
-        # 2. Decide whether to save compressed or uncompressed
         if self.resource.was_compressed and zstd is not None:
-            print("Saving as RSCC (Zstd compressed)...")
+            print(f"Saving as RSCC (Zstd compressed, Compact={self.resource.is_compact_header}, Headless={self.resource.is_headless})...")
             with open(path, "wb") as f:
                 f.write(b"RSCC")
-                f.write(struct.pack("<I", 1)) # Version
-                f.write(struct.pack("<I", 2)) # Mode 2 (Zstd)
                 block_size = 4096
-                f.write(struct.pack("<I", block_size))
                 total_size = len(uncompressed_data)
-                f.write(struct.pack("<Q", total_size))
+
+                if self.resource.is_compact_header:
+                     # Compact Header (Godot 4 variant)
+                    f.write(struct.pack("<I", 2)) # Mode 2 (Zstd)
+                    f.write(struct.pack("<I", block_size))
+                    f.write(struct.pack("<I", total_size))
+                else:
+                    # Standard Header
+                    f.write(struct.pack("<I", 1)) # Version
+                    f.write(struct.pack("<I", 2)) # Mode 2 (Zstd)
+                    f.write(struct.pack("<I", block_size))
+                    f.write(struct.pack("<Q", total_size))
                 
                 # Compress blocks
                 cctx = zstd.ZstdCompressor()
@@ -779,7 +819,7 @@ def main():
 
     args = parser.parse_args()
     
-    print("Godot Translation file Tool v1.6")
+    print("Godot Translation file Tool v1.7")
     current_directory = os.path.dirname(os.path.abspath(sys.argv[0])) 
     
     if args.export_file:
