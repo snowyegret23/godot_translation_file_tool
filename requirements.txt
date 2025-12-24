@@ -1,3 +1,1 @@
 smaz-py3
-openai
-dotenv

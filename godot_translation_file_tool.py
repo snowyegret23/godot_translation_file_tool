@@ -6,11 +6,26 @@ from enum import IntEnum
 from dataclasses import dataclass
 from io import BufferedReader, BufferedWriter
 import csv
-from dotenv import load_dotenv
-import smaz
+# smaz library required for Godot string compression
+try:
+    import smaz
+except ImportError:
+    # Fallback to bundled pure-Python implementation if the native extension isn't available
+    try:
+        import smaz_py as smaz
+        print("Notice: 'smaz' native extension not found — using bundled pure-Python fallback (smaz_py).")
+    except Exception:
+        print("Warning: 'smaz' module not found and fallback unavailable. Install 'smaz-py3' (pip install smaz-py3) or enable network access to use bundled fallback.")
+        smaz = None
 import argparse
 import subprocess
 import shutil
+
+
+def _smaz_decompress(buf: bytes) -> str:
+    if smaz is None:
+        raise RuntimeError("No smaz implementation available. Install 'smaz-py3' (pip install smaz-py3) or enable network access to use bundled fallback.")
+    return smaz.decompress(buf)
 
 def chunks(lst: list, n: int) -> list[list]:
     for i in range(0, len(lst), n):
@@ -134,9 +149,9 @@ class PropType(IntEnum):
     VARIANT_INPUT_EVENT = 25
     VARIANT_DICTIONARY = 26
     VARIANT_ARRAY = 30
-    VARIANT_PACKED_BYTE_ARRAY = 31
-    VARIANT_PACKED_INT32_ARRAY = 32
-    VARIANT_PACKED_FLOAT32_ARRAY = 33
+    VARIANT_PACKED_BYTE_ARRAY = 31 # VARIANT_RAW_ARRAY in Godot 2.x/3.x
+    VARIANT_PACKED_INT32_ARRAY = 32 # VARIANT_INT_ARRAY in Godot 2.x/3.x
+    VARIANT_PACKED_FLOAT32_ARRAY = 33 # VARIANT_REAL_ARRAY in Godot 2.x/3.x
     VARIANT_PACKED_STRING_ARRAY = 34
     VARIANT_PACKED_VECTOR3_ARRAY = 35
     VARIANT_PACKED_COLOR_ARRAY = 36
@@ -154,11 +169,13 @@ class PropType(IntEnum):
     VARIANT_VECTOR4 = 50
     VARIANT_VECTOR4I = 51
     VARIANT_PROJECTION = 52
+    VARIANT_PACKED_VECTOR4_ARRAY = 53
     OBJECT_EMPTY = 0
     OBJECT_EXTERNAL_RESOURCE = 1
     OBJECT_INTERNAL_RESOURCE = 2
     OBJECT_EXTERNAL_RESOURCE_INDEX = 3
-    FORMAT_VERSION = 5
+    FORMAT_VERSION_5 = 5
+    FORMAT_VERSION_6 = 6
     FORMAT_VERSION_CAN_RENAME_DEPS = 1
     FORMAT_VERSION_NO_NODEPATH_PROPERTY = 3
 
@@ -185,23 +202,34 @@ def parse_resource(path: str) -> Resource:
         format_version = r.get_i32()
         class_name = r.get_unicode()
         importmd_ofs = r.get_i64()
-        flags = r.get_u32()
+        
+        # Support for Godot 4.x and earlier versions (3.x, 2.x, 1.x)
+        flags = 0
+        using_uids = False
+        
+        if version_major >= 4:
+            # Godot 4.x has flags field
+            flags = r.get_u32()
+            using_named_scene_ids = bool(flags & Flag.FORMAT_FLAG_NAMED_SCENE_IDS)
+            using_uids = bool(flags & Flag.FORMAT_FLAG_UIDS)
+            r.real_is_double = bool(flags & Flag.FORMAT_FLAG_REAL_T_IS_DOUBLE)
 
-        using_named_scene_ids = bool(flags & Flag.FORMAT_FLAG_NAMED_SCENE_IDS)
-        using_uids = bool(flags & Flag.FORMAT_FLAG_UIDS)
-        r.real_is_double = bool(flags & Flag.FORMAT_FLAG_REAL_T_IS_DOUBLE)
+            if using_uids:
+                uid = r.get_u64()
+            else:
+                r.skip(8)
 
-        if using_uids:
-            uid = r.get_u64()
+            script_class = None
+            if flags & Flag.FORMAT_FLAG_HAS_SCRIPT_CLASS:
+                script_class = r.get_unicode()
+
+            for _ in range(Flag.RESERVED_FIELDS):
+                r.skip(4)
         else:
-            r.skip(8)
-
-        script_class = None
-        if flags & Flag.FORMAT_FLAG_HAS_SCRIPT_CLASS:
-            script_class = r.get_unicode()
-
-        for _ in range(Flag.RESERVED_FIELDS):
-            r.skip(4)
+            # Godot 3.x, 2.x, 1.x use 14 reserved fields after importmd_ofs
+            r.skip(14 * 4)
+            # In versions prior to 4, real_t size is determined by the header flag 'use_real64'
+            r.real_is_double = use_real64
 
         string_map = []
         string_table_size = r.get_u32()
@@ -317,6 +345,7 @@ class BinaryTranslate:
             w = Writer(f)
             w.write(b"RSRC")
             big_endian = False
+            # Godot 4.x explicitly sets this to 0 in save_binary, regardless of real_t config
             use_real64 = False
             w.store_i32(1 if big_endian else 0)
             w.store_i32(1 if use_real64 else 0)
@@ -324,17 +353,24 @@ class BinaryTranslate:
 
             w.store_i32(r.version_major)
             w.store_i32(r.version_minor)
-            w.store_i32(r.format_version)
+            w.store_i32(r.format_version) # Persist original format version
             w.store_unicode(r.class_name)
             w.store_i64(r.importmd_ofs)
-            flags = r.flags
-            if w.real_is_double:
-                flags |= Flag.FORMAT_FLAG_REAL_T_IS_DOUBLE
-            w.store_u32(flags)
-            w.store_u64(0)
+            
+            # Support for saving header based on Godot version
+            if r.version_major >= 4:
+                flags = r.flags
+                if w.real_is_double:
+                    flags |= Flag.FORMAT_FLAG_REAL_T_IS_DOUBLE
+                w.store_u32(flags)
+                w.store_u64(0) # UID placeholder
 
-            for _ in range(Flag.RESERVED_FIELDS):
-                w.store_i32(0)
+                for _ in range(Flag.RESERVED_FIELDS):
+                    w.store_i32(0)
+            else:
+                # Godot 3.x, 2.x, 1.x use 14 reserved fields
+                for _ in range(14):
+                    w.store_i32(0)
 
             w.store_u32(len(r.string_map))
             for s in r.string_map:
@@ -399,7 +435,7 @@ class BinaryTranslate:
                 if e.comp_size == e.uncomp_size:
                     msgs.append(buf.decode().strip("\0"))
                 else:
-                    msgs.append(smaz.decompress(buf).strip("\0"))
+                    msgs.append(_smaz_decompress(buf).strip("\0"))
         return msgs
 
     def replace(self, messages: list[str]):
@@ -452,8 +488,6 @@ class BinaryTranslate:
         self.bucket_table = new_bucket_table
         self.strings = new_strings
 
-load_dotenv()
-
 def get_godotpcktool_path():
     current_dir_tool = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "godotpcktool.exe")
     if os.path.exists(current_dir_tool):
@@ -496,7 +530,7 @@ def main():
 
     args = parser.parse_args()
     
-    print("Godot Translation file Tool v1.2 by Snowyegret, Original by eunchuldev")
+    print("Godot Translation file Tool v1.5")
     current_directory = os.path.dirname(os.path.abspath(sys.argv[0])) 
     
     if args.export_file:
@@ -532,6 +566,8 @@ def main():
             print(f"Successfully exported to {csv_filename}")
         except Exception as e:
             print(f"Error processing file: {e}")
+            import traceback
+            traceback.print_exc()
 
     elif args.import_file:
         print(f"Importing {args.import_file}...")
@@ -572,7 +608,7 @@ def main():
                 reader = csv.reader(f)
                 for i, row in enumerate(reader):
                     if i == 0: continue
-                    messages.append(row[1] if row[2] == "" else row[2])
+                    messages.append(row[1] if len(row) < 3 or row[2] == "" else row[2])
             
             resource.replace(messages)
             resource.locale = args.locale
@@ -589,6 +625,8 @@ def main():
 
         except Exception as e:
             print(f"Error applying translation: {e}")
+            import traceback
+            traceback.print_exc()
             sys.exit(1)
     else:
         parser.print_help()
