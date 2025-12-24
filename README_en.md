@@ -3,7 +3,7 @@
 ## Prerequisites
 
 * Install `python` (3.8+ recommended)
-* `pip install smaz-py3 dotenv`
+* `pip install smaz-py3`
 * **Important (for PCK mode)**: Download `godotpcktool.exe` from [GodotPckTool](https://github.com/hhyyrylainen/GodotPckTool/releases) and place it in this folder (or add it to your `PATH`).
 * You can download `godot_translation_file_tool.exe` from [Release](https://github.com/snowyegret23/godot_translation_file_tool/releases) for easier use.
 

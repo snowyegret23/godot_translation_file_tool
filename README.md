@@ -5,7 +5,7 @@ For English instructions, see [README_en.md](README_en.md).
 ## 기초 준비사항
 
 * `python` 설치 (3.8 이상 권장)
-* `pip install smaz-py3 dotenv`
+* `pip install smaz-py3`
 * **중요 (PCK 모드 사용 시)**: [GodotPckTool](https://github.com/hhyyrylainen/GodotPckTool/releases)에서 `godotpcktool.exe`를 다운로드하여 이 폴더(또는 `Path` 경로)에 넣어주세요.
 * [Release](https://github.com/snowyegret23/godot_translation_file_tool/releases)에서 `godot_translation_file_tool.exe`를 다운로드하여 편하게 사용하실 수 있습니다.
 
