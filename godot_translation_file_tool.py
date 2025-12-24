@@ -4,8 +4,11 @@ import os.path
 import sys
 from enum import IntEnum
 from dataclasses import dataclass
-from io import BufferedReader, BufferedWriter
+from io import BufferedReader, BufferedWriter, BytesIO
 import csv
+import zlib
+import gzip
+
 # smaz library required for Godot string compression
 try:
     import smaz
@@ -17,6 +20,13 @@ except ImportError:
     except Exception:
         print("Warning: 'smaz' module not found and fallback unavailable. Install 'smaz-py3' (pip install smaz-py3) or enable network access to use bundled fallback.")
         smaz = None
+
+# zstandard required for RSCC compressed files (Mode 2)
+try:
+    import zstandard as zstd
+except ImportError:
+    zstd = None
+
 import argparse
 import subprocess
 import shutil
@@ -95,6 +105,11 @@ class Reader:
     def get_i64(self) -> int:
         endian = ">" if self.big_endian else "<"
         return struct.unpack_from(f"{endian}l", self.file.read(8))[0]
+    
+    # Added to support Godot 1.x/2.x/3.x NodePath parsing
+    def get_u16(self) -> int:
+        endian = ">" if self.big_endian else "<"
+        return struct.unpack_from(f"{endian}H", self.file.read(2))[0]
 
     def get_u64(self) -> int:
         endian = ">" if self.big_endian else "<"
@@ -115,6 +130,12 @@ class Reader:
     def get_f64(self) -> float:
         endian = ">" if self.big_endian else "<"
         return struct.unpack_from(f"{endian}d", self.file.read(8))[0]
+    
+    def get_real(self) -> float:
+        if self.real_is_double:
+            return self.get_f64()
+        else:
+            return self.get_f32()
 
     def get_unicode(self) -> str:
         length = self.get_u32()
@@ -149,9 +170,9 @@ class PropType(IntEnum):
     VARIANT_INPUT_EVENT = 25
     VARIANT_DICTIONARY = 26
     VARIANT_ARRAY = 30
-    VARIANT_PACKED_BYTE_ARRAY = 31 # VARIANT_RAW_ARRAY in Godot 2.x/3.x
-    VARIANT_PACKED_INT32_ARRAY = 32 # VARIANT_INT_ARRAY in Godot 2.x/3.x
-    VARIANT_PACKED_FLOAT32_ARRAY = 33 # VARIANT_REAL_ARRAY in Godot 2.x/3.x
+    VARIANT_PACKED_BYTE_ARRAY = 31 # Also VARIANT_RAW_ARRAY in 1.x/2.x
+    VARIANT_PACKED_INT32_ARRAY = 32 # Also VARIANT_INT_ARRAY in 1.x/2.x
+    VARIANT_PACKED_FLOAT32_ARRAY = 33 # Also VARIANT_REAL_ARRAY in 1.x/2.x
     VARIANT_PACKED_STRING_ARRAY = 34
     VARIANT_PACKED_VECTOR3_ARRAY = 35
     VARIANT_PACKED_COLOR_ARRAY = 36
@@ -166,10 +187,12 @@ class PropType(IntEnum):
     VARIANT_VECTOR3I = 47
     VARIANT_PACKED_INT64_ARRAY = 48
     VARIANT_PACKED_FLOAT64_ARRAY = 49
+    # Godot 4.3+ new variants
     VARIANT_VECTOR4 = 50
     VARIANT_VECTOR4I = 51
     VARIANT_PROJECTION = 52
     VARIANT_PACKED_VECTOR4_ARRAY = 53
+    
     OBJECT_EMPTY = 0
     OBJECT_EXTERNAL_RESOURCE = 1
     OBJECT_INTERNAL_RESOURCE = 2
@@ -189,11 +212,65 @@ class Resource:
     flags: int
     string_map: list[str]
     properties: dict[str, any]
+    was_compressed: bool = False 
 
 def parse_resource(path: str) -> Resource:
-    with open(path, "rb") as f:
-        r = Reader(f)
-        assert b"RSRC" == r.read(4)
+    file_obj = open(path, "rb")
+    was_compressed = False
+
+    try:
+        # Check for RSCC compression header
+        magic = file_obj.read(4)
+        if magic == b"RSCC":
+            was_compressed = True
+            
+            # Read RSCC header
+            version = struct.unpack("<I", file_obj.read(4))[0]
+            mode = struct.unpack("<I", file_obj.read(4))[0] # 0=FastLZ, 1=Deflate, 2=Zstd, 3=Gzip
+            block_size = struct.unpack("<I", file_obj.read(4))[0]
+            total_size = struct.unpack("<Q", file_obj.read(8))[0]
+            
+            block_count = (total_size + block_size - 1) // block_size
+            block_sizes = []
+            for _ in range(block_count):
+                block_sizes.append(struct.unpack("<I", file_obj.read(4))[0])
+
+            decompressed_buffer = BytesIO()
+            
+            if mode == 0:
+                raise ValueError("RSCC compression mode 0 (FastLZ) is not supported by this tool (common in Godot 2.x).")
+            elif mode == 1:
+                # Deflate
+                for size in block_sizes:
+                    chunk = file_obj.read(size)
+                    decompressed_buffer.write(zlib.decompress(chunk))
+            elif mode == 2:
+                # Zstd
+                if zstd is None:
+                    raise ImportError("RSCC Zstd compressed file detected. Please install 'zstandard' (pip install zstandard) to parse this file.")
+                dctx = zstd.ZstdDecompressor()
+                for size in block_sizes:
+                    chunk = file_obj.read(size)
+                    decompressed_buffer.write(dctx.decompress(chunk))
+            elif mode == 3:
+                # Gzip
+                for size in block_sizes:
+                    chunk = file_obj.read(size)
+                    decompressed_buffer.write(gzip.decompress(chunk))
+            else:
+                 raise ValueError(f"Unsupported RSCC compression mode: {mode}.")
+
+            decompressed_buffer.seek(0)
+            file_obj.close()
+            
+            # Switch context to the decompressed memory stream
+            file_obj = decompressed_buffer
+            magic = file_obj.read(4)
+
+        r = Reader(file_obj)
+        if magic != b"RSRC":
+             raise ValueError("Invalid magic header. Expected 'RSRC' or 'RSCC'.")
+        
         big_endian = r.get_i32() == 1
         use_real64 = r.get_i32() == 1
         r.big_endian = big_endian
@@ -203,7 +280,6 @@ def parse_resource(path: str) -> Resource:
         class_name = r.get_unicode()
         importmd_ofs = r.get_i64()
         
-        # Support for Godot 4.x and earlier versions (3.x, 2.x, 1.x)
         flags = 0
         using_uids = False
         
@@ -226,9 +302,8 @@ def parse_resource(path: str) -> Resource:
             for _ in range(Flag.RESERVED_FIELDS):
                 r.skip(4)
         else:
-            # Godot 3.x, 2.x, 1.x use 14 reserved fields after importmd_ofs
+            # Godot 1.x, 2.x, and 3.x use 14 reserved fields after importmd_ofs
             r.skip(14 * 4)
-            # In versions prior to 4, real_t size is determined by the header flag 'use_real64'
             r.real_is_double = use_real64
 
         string_map = []
@@ -260,7 +335,103 @@ def parse_resource(path: str) -> Resource:
                 return r.get_f64()
             elif prop_type == PropType.VARIANT_STRING:
                 return r.get_unicode()
-            elif prop_type == PropType.VARIANT_PACKED_BYTE_ARRAY:
+            elif prop_type == PropType.VARIANT_VECTOR2:
+                r.get_real(); r.get_real()
+                return None
+            elif prop_type == PropType.VARIANT_VECTOR2I:
+                r.get_i32(); r.get_i32()
+                return None
+            elif prop_type == PropType.VARIANT_RECT2:
+                r.get_real(); r.get_real(); r.get_real(); r.get_real()
+                return None
+            elif prop_type == PropType.VARIANT_RECT2I:
+                r.get_i32(); r.get_i32(); r.get_i32(); r.get_i32()
+                return None
+            elif prop_type == PropType.VARIANT_VECTOR3:
+                r.get_real(); r.get_real(); r.get_real()
+                return None
+            elif prop_type == PropType.VARIANT_VECTOR3I:
+                r.get_i32(); r.get_i32(); r.get_i32()
+                return None
+            elif prop_type == PropType.VARIANT_VECTOR4: 
+                r.get_real(); r.get_real(); r.get_real(); r.get_real()
+                return None
+            elif prop_type == PropType.VARIANT_VECTOR4I: 
+                r.get_i32(); r.get_i32(); r.get_i32(); r.get_i32()
+                return None
+            elif prop_type == PropType.VARIANT_PLANE:
+                r.get_real(); r.get_real(); r.get_real(); r.get_real()
+                return None
+            elif prop_type == PropType.VARIANT_QUATERNION:
+                r.get_real(); r.get_real(); r.get_real(); r.get_real()
+                return None
+            elif prop_type == PropType.VARIANT_AABB:
+                r.get_real(); r.get_real(); r.get_real(); r.get_real(); r.get_real(); r.get_real()
+                return None
+            elif prop_type == PropType.VARIANT_TRANSFORM2D:
+                r.get_real(); r.get_real(); r.get_real(); r.get_real(); r.get_real(); r.get_real()
+                return None
+            elif prop_type == PropType.VARIANT_BASIS: # MATRIX3 in 1.x/2.x
+                for _ in range(9): r.get_real()
+                return None
+            elif prop_type == PropType.VARIANT_TRANSFORM3D: # TRANSFORM in 1.x/2.x
+                for _ in range(12): r.get_real()
+                return None
+            elif prop_type == PropType.VARIANT_PROJECTION: 
+                for _ in range(16): r.get_real()
+                return None
+            elif prop_type == PropType.VARIANT_COLOR:
+                r.get_f32(); r.get_f32(); r.get_f32(); r.get_f32() 
+                return None
+            elif prop_type == PropType.VARIANT_STRING_NAME:
+                return r.get_unicode()
+            elif prop_type == PropType.VARIANT_NODE_PATH:
+                # Godot 1.x/2.x/3.x use 16-bit integers for name_count and subname_count
+                name_count = r.get_u16()
+                subname_count = r.get_u16()
+                # absolute = subname_count & 0x8000
+                subname_count &= 0x7FFF
+                
+                # In Godot 1.x/2.x and early 3.x, the 'property' field was sometimes stored 
+                # effectively as an extra subname or handled distinctively.
+                # Incrementing subname_count captures the property string if it exists in that sequence.
+                if format_version < 3: 
+                    subname_count += 1
+                
+                for _ in range(name_count): _parse_name() 
+                for _ in range(subname_count): _parse_name()
+                return None
+            elif prop_type == PropType.VARIANT_RID:
+                r.get_u32()
+                return None
+            elif prop_type == PropType.VARIANT_OBJECT:
+                # Updated to handle Godot 1.x/2.x Object variants safely
+                obj_type = r.get_u32() 
+                if obj_type == PropType.OBJECT_EMPTY:
+                    pass
+                elif obj_type == PropType.OBJECT_EXTERNAL_RESOURCE:
+                    r.get_unicode() # type
+                    r.get_unicode() # path
+                elif obj_type == PropType.OBJECT_INTERNAL_RESOURCE:
+                    r.get_u32() # index
+                elif obj_type == PropType.OBJECT_EXTERNAL_RESOURCE_INDEX:
+                    r.get_u32() # index
+                return None 
+            elif prop_type == PropType.VARIANT_DICTIONARY:
+                length = r.get_u32() & 0x7FFFFFFF
+                d = {}
+                for _ in range(length):
+                    key = _parse_value() 
+                    val = _parse_value() 
+                    if key is not None: d[key] = val
+                return d
+            elif prop_type == PropType.VARIANT_ARRAY:
+                length = r.get_u32() & 0x7FFFFFFF
+                arr = []
+                for _ in range(length):
+                    arr.append(_parse_value())
+                return arr
+            elif prop_type == PropType.VARIANT_PACKED_BYTE_ARRAY: # RAW_ARRAY in 1.x/2.x
                 length = r.get_u32()
                 res = b"".join(r.get_u8() for _ in range(length))
                 extra = 4 - (length % 4)
@@ -268,9 +439,37 @@ def parse_resource(path: str) -> Resource:
                     for _ in range(extra):
                         r.get_u8()
                 return res
-            elif prop_type == PropType.VARIANT_PACKED_INT32_ARRAY:
+            elif prop_type == PropType.VARIANT_PACKED_INT32_ARRAY: # INT_ARRAY in 1.x/2.x
                 length = r.get_u32()
                 return [r.get_i32() for _ in range(length)]
+            elif prop_type == PropType.VARIANT_PACKED_INT64_ARRAY:
+                length = r.get_u32()
+                return [r.get_i64() for _ in range(length)]
+            elif prop_type == PropType.VARIANT_PACKED_FLOAT32_ARRAY: # REAL_ARRAY in 1.x/2.x
+                length = r.get_u32()
+                return [r.get_f32() for _ in range(length)]
+            elif prop_type == PropType.VARIANT_PACKED_FLOAT64_ARRAY:
+                length = r.get_u32()
+                return [r.get_f64() for _ in range(length)]
+            elif prop_type == PropType.VARIANT_PACKED_STRING_ARRAY:
+                length = r.get_u32()
+                return [r.get_unicode() for _ in range(length)]
+            elif prop_type == PropType.VARIANT_PACKED_VECTOR2_ARRAY:
+                length = r.get_u32()
+                for _ in range(length): r.get_real(); r.get_real()
+                return None
+            elif prop_type == PropType.VARIANT_PACKED_VECTOR3_ARRAY:
+                length = r.get_u32()
+                for _ in range(length): r.get_real(); r.get_real(); r.get_real()
+                return None
+            elif prop_type == PropType.VARIANT_PACKED_COLOR_ARRAY:
+                length = r.get_u32()
+                for _ in range(length): r.get_f32(); r.get_f32(); r.get_f32(); r.get_f32()
+                return None
+            elif prop_type == PropType.VARIANT_PACKED_VECTOR4_ARRAY: 
+                length = r.get_u32()
+                for _ in range(length): r.get_real(); r.get_real(); r.get_real(); r.get_real()
+                return None
             else:
                 return None
 
@@ -304,9 +503,13 @@ def parse_resource(path: str) -> Resource:
                 continue
 
             if i == len(internal_resources) - 1:
-                main_resource = Resource(version_major, version_minor, format_version, importmd_ofs, class_name, flags, string_map, properties)
-
+                main_resource = Resource(version_major, version_minor, format_version, importmd_ofs, class_name, flags, string_map, properties, was_compressed)
+        
+        file_obj.close()
         return main_resource
+    except Exception as e:
+        file_obj.close()
+        raise e
 
 def hash(d: int, b: bytes) -> int:
     if d == 0:
@@ -339,77 +542,123 @@ class BinaryTranslate:
         self.locale = res.properties.get("locale", "en")
         self.resource = res
 
-    def save(self, path: str):
+    def _write_resource_data(self, f: BufferedWriter):
         r = self.resource
-        with open(path, "wb") as f:
-            w = Writer(f)
-            w.write(b"RSRC")
-            big_endian = False
-            # Godot 4.x explicitly sets this to 0 in save_binary, regardless of real_t config
-            use_real64 = False
-            w.store_i32(1 if big_endian else 0)
-            w.store_i32(1 if use_real64 else 0)
-            w.big_endian = big_endian
+        w = Writer(f)
+        w.write(b"RSRC")
+        big_endian = False
+        use_real64 = False # Preserving original flag in header
+        w.store_i32(1 if big_endian else 0)
+        w.store_i32(1 if use_real64 else 0)
+        w.big_endian = big_endian
 
-            w.store_i32(r.version_major)
-            w.store_i32(r.version_minor)
-            w.store_i32(r.format_version) # Persist original format version
-            w.store_unicode(r.class_name)
-            w.store_i64(r.importmd_ofs)
+        w.store_i32(r.version_major)
+        w.store_i32(r.version_minor)
+        w.store_i32(r.format_version) 
+        w.store_unicode(r.class_name)
+        w.store_i64(r.importmd_ofs)
+        
+        if r.version_major >= 4:
+            flags = r.flags
+            if w.real_is_double:
+                flags |= Flag.FORMAT_FLAG_REAL_T_IS_DOUBLE
+            w.store_u32(flags)
+            w.store_u64(0) # UID placeholder
+
+            for _ in range(Flag.RESERVED_FIELDS):
+                w.store_i32(0)
+        else:
+            # Godot 1.x, 2.x, 3.x
+            for _ in range(14):
+                w.store_i32(0)
+
+        w.store_u32(len(r.string_map))
+        for s in r.string_map:
+            w.store_unicode(s)
+
+        # External Resources (Dummy for Translation files)
+        w.store_u32(0) 
+        
+        # Internal Resources (Main Resource)
+        w.store_u32(1)
+        w.store_unicode("local://0")
+        offset = f.tell() + 8
+        w.store_u64(offset)
+
+        # Object Data
+        w.store_unicode(r.class_name)
+        w.store_i32(4) # property count
+
+        w.store_u32(r.string_map.index("locale"))
+        w.store_u32(PropType.VARIANT_STRING)
+        w.store_unicode(self.locale)
+
+        w.store_u32(r.string_map.index("hash_table"))
+        w.store_u32(PropType.VARIANT_PACKED_INT32_ARRAY)
+        w.store_u32(len(self.hash_table))
+        for v in self.hash_table:
+            w.store_i32(v)
+
+        w.store_u32(r.string_map.index("bucket_table"))
+        w.store_u32(PropType.VARIANT_PACKED_INT32_ARRAY)
+        w.store_u32(len(self.bucket_table))
+        for v in self.bucket_table:
+            w.store_i32(v)
+
+        w.store_u32(r.string_map.index("strings"))
+        w.store_u32(PropType.VARIANT_PACKED_BYTE_ARRAY)
+        w.store_u32(len(self.strings))
+        w.write(self.strings)
+        extra = 4 - (len(self.strings) % 4)
+        if extra < 4:
+            w.write(b"\0" * extra)
+
+        w.write(b"RSRC")
+
+    def save(self, path: str):
+        # 1. Generate Uncompressed Data
+        uncompressed_buffer = BytesIO()
+        self._write_resource_data(uncompressed_buffer)
+        uncompressed_data = uncompressed_buffer.getvalue()
+        uncompressed_buffer.close()
+
+        # 2. Decide whether to save compressed or uncompressed
+        if self.resource.was_compressed and zstd is not None:
+            print("Saving as RSCC (Zstd compressed)...")
+            with open(path, "wb") as f:
+                f.write(b"RSCC")
+                f.write(struct.pack("<I", 1)) # Version
+                f.write(struct.pack("<I", 2)) # Mode 2 (Zstd)
+                block_size = 4096
+                f.write(struct.pack("<I", block_size))
+                total_size = len(uncompressed_data)
+                f.write(struct.pack("<Q", total_size))
+                
+                # Compress blocks
+                cctx = zstd.ZstdCompressor()
+                compressed_blocks = []
+                block_sizes = []
+                
+                for i in range(0, total_size, block_size):
+                    chunk = uncompressed_data[i:i+block_size]
+                    compressed = cctx.compress(chunk)
+                    compressed_blocks.append(compressed)
+                    block_sizes.append(len(compressed))
+                
+                # Write block sizes table
+                for size in block_sizes:
+                    f.write(struct.pack("<I", size))
+                    
+                # Write data blocks
+                for block in compressed_blocks:
+                    f.write(block)
+        else:
+            if self.resource.was_compressed and zstd is None:
+                print("Warning: Original file was RSCC compressed but 'zstandard' module is missing for re-compression. Saving as uncompressed RSRC.")
             
-            # Support for saving header based on Godot version
-            if r.version_major >= 4:
-                flags = r.flags
-                if w.real_is_double:
-                    flags |= Flag.FORMAT_FLAG_REAL_T_IS_DOUBLE
-                w.store_u32(flags)
-                w.store_u64(0) # UID placeholder
-
-                for _ in range(Flag.RESERVED_FIELDS):
-                    w.store_i32(0)
-            else:
-                # Godot 3.x, 2.x, 1.x use 14 reserved fields
-                for _ in range(14):
-                    w.store_i32(0)
-
-            w.store_u32(len(r.string_map))
-            for s in r.string_map:
-                w.store_unicode(s)
-
-            w.store_u32(0)
-            w.store_u32(1)
-            w.store_unicode("local://0")
-            offset = f.tell() + 8
-            w.store_u64(offset)
-
-            w.store_unicode(r.class_name)
-            w.store_i32(4)
-
-            w.store_u32(r.string_map.index("locale"))
-            w.store_u32(PropType.VARIANT_STRING)
-            w.store_unicode(self.locale)
-
-            w.store_u32(r.string_map.index("hash_table"))
-            w.store_u32(PropType.VARIANT_PACKED_INT32_ARRAY)
-            w.store_u32(len(self.hash_table))
-            for v in self.hash_table:
-                w.store_i32(v)
-
-            w.store_u32(r.string_map.index("bucket_table"))
-            w.store_u32(PropType.VARIANT_PACKED_INT32_ARRAY)
-            w.store_u32(len(self.bucket_table))
-            for v in self.bucket_table:
-                w.store_i32(v)
-
-            w.store_u32(r.string_map.index("strings"))
-            w.store_u32(PropType.VARIANT_PACKED_BYTE_ARRAY)
-            w.store_u32(len(self.strings))
-            w.write(self.strings)
-            extra = 4 - (len(self.strings) % 4)
-            if extra < 4:
-                w.write(b"\0" * extra)
-
-            w.write(b"RSRC")
+            # Save as standard RSRC
+            with open(path, "wb") as f:
+                f.write(uncompressed_data)
 
     def get_messages(self) -> list[str]:
         msgs = []

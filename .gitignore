@@ -7,6 +7,7 @@ assets/
 *.pck
 *.translation
 godot-src/
+*.bat
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
